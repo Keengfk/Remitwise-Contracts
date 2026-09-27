@@ -4058,6 +4058,625 @@ mod testsuit {
         assert!(client.get_archived_bill(&id2).is_some());
     }
 
+    // =========================================================================
+    // get_upgrade_admin / set_upgrade_admin failure-boundary coverage
+    // =========================================================================
+    //
+    // Invariants enforced by this section:
+    //   I1. Before any set_upgrade_admin call, get_upgrade_admin_public returns None.
+    //   I2. Bootstrap: caller must equal new_admin; any other address is Unauthorized.
+    //   I3. After bootstrap, get_upgrade_admin_public returns Some(admin).
+    //   I4. Transfer: only the current admin can rotate; anyone else is Unauthorized.
+    //   I5. Transfer to the same address is SameAdmin.
+    //   I6. After a valid transfer the old admin can no longer rotate.
+    //   I7. set_upgrade_admin panics (kill-switch) when the kill switch is active.
+    //   I8. pre_upgrade is Unauthorized if no upgrade admin is set.
+    //   I9. pre_upgrade is Unauthorized if called by a non-admin address.
+    //   I10. restore_from_snapshot restores the upgrade_admin field stored in the
+    //        snapshot; after restore get_upgrade_admin_public still returns the value
+    //        that was snapshotted, making the call idempotent for the admin field.
+    //   I11. set_version is Unauthorized when no upgrade admin exists.
+    //   I12. set_version is Unauthorized when called by a non-admin address.
+    //   I13. A second bootstrap attempt (admin already set, caller != current admin)
+    //        is Unauthorized — only the current admin may rotate.
+    //   I14. get_upgrade_admin_public is permissionless (no auth required).
+    //   I15. Concurrent/stale: a caller that held admin before a transfer is rejected
+    //        after the transfer completes.
+
+    /// I1 — Before any set_upgrade_admin call the public accessor returns None.
+    #[test]
+    fn test_get_upgrade_admin_returns_none_when_uninitialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        // No setup: upgrade admin has never been set.
+        assert_eq!(
+            client.get_upgrade_admin_public(),
+            None,
+            "upgrade admin must be None before bootstrap"
+        );
+    }
+
+    /// I14 — get_upgrade_admin_public is permissionless; no auth is required.
+    #[test]
+    fn test_get_upgrade_admin_public_requires_no_auth() {
+        let env = Env::default();
+        // Deliberately do NOT call env.mock_all_auths() — query must succeed without auth.
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        // The call must not panic and must return None (no admin set).
+        let result = client.get_upgrade_admin_public();
+        assert!(
+            result.is_none(),
+            "get_upgrade_admin_public must succeed without auth and return None"
+        );
+    }
+
+    /// I2 / I3 — Bootstrap: caller == new_admin sets the admin; caller != new_admin
+    /// is rejected with Unauthorized before any state is written.
+    #[test]
+    fn test_set_upgrade_admin_bootstrap_caller_must_equal_new_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        // Alice tries to bootstrap with bob as the new admin — must fail.
+        let result = client.try_set_upgrade_admin(&alice, &bob);
+        assert_eq!(
+            result,
+            Err(Ok(Error::Unauthorized)),
+            "bootstrap with caller != new_admin must return Unauthorized"
+        );
+
+        // No admin must have been written despite the failed call.
+        assert_eq!(
+            client.get_upgrade_admin_public(),
+            None,
+            "failed bootstrap must leave upgrade admin as None"
+        );
+    }
+
+    /// I2 / I3 — Successful bootstrap: caller bootstraps themselves as admin.
+    #[test]
+    fn test_set_upgrade_admin_bootstrap_self_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        let alice = Address::generate(&env);
+
+        client.set_upgrade_admin(&alice, &alice);
+
+        assert_eq!(
+            client.get_upgrade_admin_public(),
+            Some(alice.clone()),
+            "get_upgrade_admin_public must return alice after bootstrap"
+        );
+    }
+
+    /// I4 — Transfer: only the current admin can rotate the key.
+    /// A third-party caller is Unauthorized even when they supply a valid new_admin.
+    #[test]
+    fn test_set_upgrade_admin_transfer_unauthorized_third_party() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        let carol = Address::generate(&env);
+
+        // Bootstrap: alice becomes admin.
+        client.set_upgrade_admin(&alice, &alice);
+
+        // Carol (not alice) tries to transfer admin to bob — must be Unauthorized.
+        let result = client.try_set_upgrade_admin(&carol, &bob);
+        assert_eq!(
+            result,
+            Err(Ok(Error::Unauthorized)),
+            "non-admin caller must be Unauthorized during transfer"
+        );
+
+        // Admin must still be alice.
+        assert_eq!(
+            client.get_upgrade_admin_public(),
+            Some(alice.clone()),
+            "upgrade admin must remain alice after rejected transfer attempt"
+        );
+    }
+
+    /// I5 — SameAdmin: rotating to the current address is rejected.
+    #[test]
+    fn test_set_upgrade_admin_same_admin_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        let alice = Address::generate(&env);
+
+        // Bootstrap alice.
+        client.set_upgrade_admin(&alice, &alice);
+
+        // Alice tries to "rotate" to herself.
+        let result = client.try_set_upgrade_admin(&alice, &alice);
+        assert_eq!(
+            result,
+            Err(Ok(Error::SameAdmin)),
+            "rotating to the same address must return SameAdmin"
+        );
+
+        // Admin must still be alice and unchanged.
+        assert_eq!(
+            client.get_upgrade_admin_public(),
+            Some(alice.clone()),
+            "upgrade admin must remain alice after rejected same-admin call"
+        );
+    }
+
+    /// I4 / I6 — Successful transfer: after rotation the old admin cannot rotate again.
+    #[test]
+    fn test_set_upgrade_admin_transfer_succeeds_and_old_admin_loses_access() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        let carol = Address::generate(&env);
+
+        // Bootstrap alice, then transfer to bob.
+        client.set_upgrade_admin(&alice, &alice);
+        client.set_upgrade_admin(&alice, &bob);
+
+        // Bob is now the admin.
+        assert_eq!(
+            client.get_upgrade_admin_public(),
+            Some(bob.clone()),
+            "upgrade admin must be bob after transfer"
+        );
+
+        // Alice (old admin) cannot rotate anymore.
+        let result = client.try_set_upgrade_admin(&alice, &carol);
+        assert_eq!(
+            result,
+            Err(Ok(Error::Unauthorized)),
+            "old admin must be Unauthorized after transferring the role"
+        );
+
+        // Admin must still be bob.
+        assert_eq!(
+            client.get_upgrade_admin_public(),
+            Some(bob.clone()),
+            "upgrade admin must remain bob after alice's rejected attempt"
+        );
+    }
+
+    /// I13 — Second bootstrap attempt by a different address (admin already set) is
+    /// Unauthorized — the bootstrap path is a one-time operation.
+    #[test]
+    fn test_set_upgrade_admin_second_bootstrap_attempt_by_different_address_is_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        // Alice bootstraps.
+        client.set_upgrade_admin(&alice, &alice);
+
+        // Bob tries to bootstrap himself — must fail because an admin already exists
+        // and bob is not that admin.
+        let result = client.try_set_upgrade_admin(&bob, &bob);
+        assert_eq!(
+            result,
+            Err(Ok(Error::Unauthorized)),
+            "second bootstrap attempt by a different address must be Unauthorized"
+        );
+
+        assert_eq!(
+            client.get_upgrade_admin_public(),
+            Some(alice.clone()),
+            "upgrade admin must remain alice after rejected second-bootstrap attempt"
+        );
+    }
+
+    /// I7 — set_upgrade_admin panics when the kill switch is active.
+    /// The contract uses panic_with_error! so we expect a host-level error.
+    #[test]
+    fn test_set_upgrade_admin_blocked_when_kill_switch_active() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        let alice = Address::generate(&env);
+
+        // Activate the kill switch inside the contract's own instance storage.
+        env.as_contract(&contract_id, || {
+            remitwise_common::activate_kill_switch(&env);
+        });
+
+        // set_upgrade_admin must be blocked.
+        let result = client.try_set_upgrade_admin(&alice, &alice);
+        assert!(
+            result.is_err(),
+            "set_upgrade_admin must fail when kill switch is active"
+        );
+
+        // No admin must have been written.
+        // (get_upgrade_admin_public is a read — it is NOT kill-switch-gated.)
+        assert_eq!(
+            client.get_upgrade_admin_public(),
+            None,
+            "upgrade admin must remain None after blocked bootstrap attempt"
+        );
+    }
+
+    /// I7 — Kill switch also blocks a transfer (not just bootstrap).
+    #[test]
+    fn test_set_upgrade_admin_transfer_blocked_when_kill_switch_active() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        // Bootstrap before activating kill switch.
+        client.set_upgrade_admin(&alice, &alice);
+
+        env.as_contract(&contract_id, || {
+            remitwise_common::activate_kill_switch(&env);
+        });
+
+        let result = client.try_set_upgrade_admin(&alice, &bob);
+        assert!(
+            result.is_err(),
+            "set_upgrade_admin transfer must fail when kill switch is active"
+        );
+
+        // Admin must still be alice — no partial write.
+        assert_eq!(
+            client.get_upgrade_admin_public(),
+            Some(alice.clone()),
+            "upgrade admin must remain alice after kill-switch-blocked transfer"
+        );
+    }
+
+    /// I8 — pre_upgrade is Unauthorized if no upgrade admin is set.
+    #[test]
+    fn test_pre_upgrade_unauthorized_when_no_admin_set() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        let alice = Address::generate(&env);
+
+        let result = client.try_pre_upgrade(&alice);
+        assert_eq!(
+            result,
+            Err(Ok(Error::Unauthorized)),
+            "pre_upgrade must return Unauthorized when no upgrade admin is configured"
+        );
+    }
+
+    /// I9 — pre_upgrade is Unauthorized if called by a non-admin.
+    #[test]
+    fn test_pre_upgrade_unauthorized_when_called_by_non_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.set_upgrade_admin(&alice, &alice);
+
+        let result = client.try_pre_upgrade(&bob);
+        assert_eq!(
+            result,
+            Err(Ok(Error::Unauthorized)),
+            "pre_upgrade must return Unauthorized when caller is not the upgrade admin"
+        );
+    }
+
+    /// I8 + pre_upgrade happy-path — the upgrade admin can take a snapshot.
+    #[test]
+    fn test_pre_upgrade_succeeds_when_called_by_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        let alice = Address::generate(&env);
+        client.set_upgrade_admin(&alice, &alice);
+
+        // pre_upgrade must succeed for the current admin.
+        let result = client.try_pre_upgrade(&alice);
+        assert!(
+            result.is_ok(),
+            "pre_upgrade must succeed when called by the upgrade admin"
+        );
+    }
+
+    /// I10 — restore_from_snapshot restores the upgrade_admin field from the
+    /// snapshot, making get_upgrade_admin_public return the snapshotted admin.
+    ///
+    /// This is the idempotency invariant: running restore twice is safe because
+    /// the second call fails with SnapshotNotFound (snapshot consumed on first
+    /// restore), but the admin field retains the snapshotted value.
+    #[test]
+    fn test_restore_from_snapshot_restores_upgrade_admin_field() {
+        let env = Env::default();
+        env.mock_all_auths();
+        set_ledger_time(&env, 1, 1_000_000);
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        let alice = Address::generate(&env);
+        client.set_upgrade_admin(&alice, &alice);
+
+        // Take snapshot.
+        client.pre_upgrade(&alice);
+
+        // Simulate an upgrade overwriting the admin in instance storage by
+        // writing a different admin directly into contract storage.
+        let bob = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .instance()
+                .set(&soroban_sdk::symbol_short!("UPG_ADM"), &bob);
+        });
+        assert_eq!(
+            client.get_upgrade_admin_public(),
+            Some(bob.clone()),
+            "precondition: admin must be bob after simulated upgrade overwrite"
+        );
+
+        // Restore from snapshot — must reinstate alice.
+        let result = client.try_restore_from_snapshot(&alice);
+        assert!(
+            result.is_err(),
+            "restore_from_snapshot must fail when called with the post-upgrade admin (bob wrote the snapshot, alice did not set bob as admin)"
+        );
+
+        // Restore via alice — but wait, alice wrote the snapshot, and the snapshot
+        // captured alice as upgrade_admin.  After the simulated overwrite the
+        // current instance admin is bob, so alice.require_auth() passes (mock_all_auths)
+        // but the guard checks get_upgrade_admin (which now returns bob) against
+        // caller (alice) → Unauthorized.
+        //
+        // The correct caller is bob (the current admin after the overwrite).
+        // Let's do the restore as bob.
+        let result = client.try_restore_from_snapshot(&bob);
+        assert!(
+            result.is_ok(),
+            "restore_from_snapshot must succeed when called by the current admin (bob)"
+        );
+
+        // The snapshot recorded alice as upgrade_admin, so after restore alice
+        // is reinstated.
+        assert_eq!(
+            client.get_upgrade_admin_public(),
+            Some(alice.clone()),
+            "restore_from_snapshot must reinstate alice as upgrade admin from the snapshot"
+        );
+
+        // Idempotency: a second restore attempt must fail because the snapshot was
+        // consumed on the first successful restore.
+        let result2 = client.try_restore_from_snapshot(&alice);
+        assert_eq!(
+            result2,
+            Err(Ok(Error::SnapshotNotFound)),
+            "second restore must fail with SnapshotNotFound (snapshot is consumed)"
+        );
+
+        // Admin field must still be alice — second attempt did not corrupt state.
+        assert_eq!(
+            client.get_upgrade_admin_public(),
+            Some(alice.clone()),
+            "upgrade admin must remain alice after failed second restore"
+        );
+    }
+
+    /// I11 — set_version is Unauthorized when no upgrade admin is set.
+    #[test]
+    fn test_set_version_unauthorized_when_no_upgrade_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        let alice = Address::generate(&env);
+
+        let result = client.try_set_version(&alice, &2);
+        assert_eq!(
+            result,
+            Err(Ok(Error::Unauthorized)),
+            "set_version must return Unauthorized when no upgrade admin is configured"
+        );
+    }
+
+    /// I12 — set_version is Unauthorized when called by a non-admin.
+    #[test]
+    fn test_set_version_unauthorized_when_called_by_non_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.set_upgrade_admin(&alice, &alice);
+
+        let result = client.try_set_version(&bob, &2);
+        assert_eq!(
+            result,
+            Err(Ok(Error::Unauthorized)),
+            "set_version must return Unauthorized when caller is not the upgrade admin"
+        );
+    }
+
+    /// I15 — Stale/concurrent: a caller that was admin before a transfer is
+    /// rejected after the transfer completes.
+    ///
+    /// This covers the "stale reference" threat: a legitimate admin who still
+    /// holds an old reference after a rotation attempt to act on a now-stale key.
+    #[test]
+    fn test_stale_admin_rejected_after_transfer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        let carol = Address::generate(&env);
+
+        // Alice bootstraps and transfers to bob.
+        client.set_upgrade_admin(&alice, &alice);
+        client.set_upgrade_admin(&alice, &bob);
+
+        // Alice (now stale) tries to rotate again — must be Unauthorized.
+        let stale_result = client.try_set_upgrade_admin(&alice, &carol);
+        assert_eq!(
+            stale_result,
+            Err(Ok(Error::Unauthorized)),
+            "stale admin must be Unauthorized after losing the role"
+        );
+
+        // Alice also cannot call pre_upgrade.
+        let pre_result = client.try_pre_upgrade(&alice);
+        assert_eq!(
+            pre_result,
+            Err(Ok(Error::Unauthorized)),
+            "stale admin must be Unauthorized for pre_upgrade after losing the role"
+        );
+
+        // Alice also cannot call set_version.
+        let ver_result = client.try_set_version(&alice, &99);
+        assert_eq!(
+            ver_result,
+            Err(Ok(Error::Unauthorized)),
+            "stale admin must be Unauthorized for set_version after losing the role"
+        );
+
+        // Bob (current admin) still works.
+        assert_eq!(
+            client.get_upgrade_admin_public(),
+            Some(bob.clone()),
+            "upgrade admin must be bob throughout stale-caller tests"
+        );
+    }
+
+    /// Regression: get_upgrade_admin_public is stable — returns the same value
+    /// across repeated calls without consuming or altering state.
+    #[test]
+    fn test_get_upgrade_admin_public_is_read_only_and_stable() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        let alice = Address::generate(&env);
+        client.set_upgrade_admin(&alice, &alice);
+
+        // Call the public accessor multiple times — must always return alice.
+        for _ in 0..3 {
+            assert_eq!(
+                client.get_upgrade_admin_public(),
+                Some(alice.clone()),
+                "get_upgrade_admin_public must return alice on every call"
+            );
+        }
+    }
+
+    /// Boundary: multi-hop transfer chain is consistent at every step.
+    ///
+    /// Validates that admin is updated correctly through a full A→B→C→D chain
+    /// and that revoked admins cannot act at any point in the chain.
+    #[test]
+    fn test_upgrade_admin_multi_hop_transfer_chain() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        let carol = Address::generate(&env);
+        let dave = Address::generate(&env);
+
+        // Bootstrap.
+        client.set_upgrade_admin(&alice, &alice);
+        assert_eq!(client.get_upgrade_admin_public(), Some(alice.clone()));
+
+        // A → B.
+        client.set_upgrade_admin(&alice, &bob);
+        assert_eq!(client.get_upgrade_admin_public(), Some(bob.clone()));
+        // Alice is now stale.
+        assert_eq!(
+            client.try_set_upgrade_admin(&alice, &carol),
+            Err(Ok(Error::Unauthorized))
+        );
+
+        // B → C.
+        client.set_upgrade_admin(&bob, &carol);
+        assert_eq!(client.get_upgrade_admin_public(), Some(carol.clone()));
+        // Bob is now stale.
+        assert_eq!(
+            client.try_set_upgrade_admin(&bob, &dave),
+            Err(Ok(Error::Unauthorized))
+        );
+
+        // C → D.
+        client.set_upgrade_admin(&carol, &dave);
+        assert_eq!(client.get_upgrade_admin_public(), Some(dave.clone()));
+        // Carol is now stale.
+        assert_eq!(
+            client.try_set_upgrade_admin(&carol, &alice),
+            Err(Ok(Error::Unauthorized))
+        );
+    }
+
+    /// Boundary: bootstrap with None initial state — get_upgrade_admin_public
+    /// returns None, then Some after bootstrap, not Some of the wrong address.
+    #[test]
+    fn test_upgrade_admin_transition_none_to_some() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+
+        let alice = Address::generate(&env);
+
+        // Confirm None before bootstrap.
+        assert_eq!(client.get_upgrade_admin_public(), None);
+
+        // Bootstrap.
+        client.set_upgrade_admin(&alice, &alice);
+
+        // Confirm Some(alice) — not Some(wrong_address) or None.
+        assert_eq!(client.get_upgrade_admin_public(), Some(alice.clone()));
+    }
+
     /// Verify repeated pay_bill calls leave no partial state.
     #[test]
     fn test_repeated_pay_bill_no_partial_state() {

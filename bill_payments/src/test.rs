@@ -2,8 +2,10 @@
 mod testsuit {
     extern crate std;
 
+    use crate::pause_functions;
     use crate::*;
     use proptest::prelude::*;
+    use remitwise_common;
     use soroban_sdk::testutils::storage::Instance as _;
     use soroban_sdk::testutils::{Address as AddressTrait, Ledger, LedgerInfo};
     use soroban_sdk::{Address, Env, IntoVal, String};
@@ -1026,7 +1028,44 @@ mod testsuit {
     }
 
     #[test]
-    fn test_get_unpaid_bills() {
+    fn test_without_success() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        let result = client.try_without(&owner, &1);
+        assert_eq!(result, Ok(Ok(())));
+    }
+
+    #[test]
+    fn test_without_invalid_id() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        let result = client.try_without(&owner, &0);
+        assert_eq!(result, Err(Ok(Error::BillNotFound)));
+    }
+
+    #[test]
+    fn test_without_unauthorized_id() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
+
+        env.mock_all_auths();
+        let result = client.try_without(&owner, &999);
+        assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_get_all_bills_admin_only() {
         let env = Env::default();
         let contract_id = env.register_contract(None, BillPayments);
         let client = BillPaymentsClient::new(&env, &contract_id);
@@ -6054,6 +6093,53 @@ mod testsuit {
     }
 
     #[test]
+    fn test_paused_since_tracks_successful_global_pause_lifecycle() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.set_pause_admin(&admin, &admin);
+        env.ledger().set_timestamp(0);
+
+        assert_eq!(client.get_paused_since(), None);
+        client.pause(&admin);
+        assert_eq!(client.get_paused_since(), Some(0));
+
+        env.ledger().set_timestamp(2000);
+        client.pause(&admin);
+        assert_eq!(client.get_paused_since(), Some(0));
+
+        client.schedule_unpause(&admin, &3000);
+        env.ledger().set_timestamp(2999);
+        assert_eq!(client.try_unpause(&admin), Err(Ok(Error::ContractPaused)));
+        assert!(client.is_paused());
+        assert_eq!(client.get_paused_since(), Some(0));
+
+        env.ledger().set_timestamp(3000);
+        client.unpause(&admin);
+        assert!(!client.is_paused());
+        assert_eq!(client.get_paused_since(), None);
+    }
+
+    #[test]
+    fn test_unauthorized_pause_does_not_set_paused_since() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, BillPayments);
+        let client = BillPaymentsClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let other = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.set_pause_admin(&admin, &admin);
+
+        assert_eq!(client.try_pause(&other), Err(Ok(Error::UnauthorizedPause)));
+        assert!(!client.is_paused());
+        assert_eq!(client.get_paused_since(), None);
+    }
+
+    #[test]
     fn test_schedule_unpause_replaces_existing_pending_schedule() {
         let env = Env::default();
         let contract_id = env.register_contract(None, BillPayments);
@@ -6147,8 +6233,8 @@ mod testsuit {
         assert!(client.get_bill(&888).is_none());
     }
 
-    /// Verify batch_pay_bills is fully atomic: if one recurring bill
-    /// computation overflows, the entire batch reverts with no changes.
+    /// Verify batch_pay_bills is fully atomic when recurring child creation
+    /// fails after earlier bills have been staged.
     #[test]
     fn test_batch_pay_bills_atomic_rollback_on_overflow() {
         let env = Env::default();
@@ -6157,21 +6243,20 @@ mod testsuit {
         let owner = <soroban_sdk::Address as AddressTrait>::generate(&env);
         env.mock_all_auths();
 
-        // Create two recurring bills
         let id1 = client.create_bill(
             &owner,
             &String::from_str(&env, "Safe"),
             &100,
             &1_000_000,
-            &true,
-            &30,
+            &false,
+            &0,
             &None,
             &String::from_str(&env, "XLM"),
             &None,
         );
         let id2 = client.create_bill(
             &owner,
-            &String::from_str(&env, "Safe2"),
+            &String::from_str(&env, "Recurring"),
             &200,
             &1_000_000,
             &true,

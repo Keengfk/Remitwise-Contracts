@@ -4979,4 +4979,4 @@ mod tests_pause_admin_boundary;
 #[cfg(test)]
 mod tests_set_pause_admin_boundary;
 #[cfg(test)]
-mod upgrade_admin_boundary_tests;
+mod upgrade_pre_upgrade_boundary_tests;
